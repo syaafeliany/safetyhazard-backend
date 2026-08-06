@@ -772,10 +772,12 @@ async def finalize_inspection(
     inspection.image_url = f"{SUPABASE_URL}/storage/v1/object/public/inspections/{filename}"
     inspection_area = area or inspection.area or "spray_decoration"
 
-    # 3. Pipeline penuh → hazard siap disimpan
+    # 3. Pipeline penuh → hazard siap disimpan (pakai bytes frame langsung,
+    # bukan URL — cara yang sama reliabel seperti analyze-frame supaya
+    # menghindari kegagalan download dari URL Supabase storage)
     try:
         raw_detections, enriched_hazards = await run_full_pipeline(
-            inspection.image_url, inspection_area
+            image_url="", area=inspection_area, image_bytes=image_bytes
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"AI analysis failed: {str(e)}")

@@ -191,14 +191,21 @@ def get_analysis_dimensions(image_bytes: bytes) -> tuple:
         return 0, 0
 
 
-async def run_full_pipeline(image_url: str, area: str = "spray_decoration") -> tuple:
+async def run_full_pipeline(image_url: str = "", area: str = "spray_decoration", image_bytes: bytes | None = None) -> tuple:
     """
     Return tuple: (raw_detections, enriched_hazards)
     - raw_detections: deteksi mentah dari YOLO (untuk summary stats)
     - enriched_hazards: hazard yang sudah diproses dengan RAG + severity
+
+    Kirim gambar via `image_bytes` (bytes langsung, seperti analyze-frame /
+    live-preview yang reliabel) ATAU `image_url` (download dulu). Bytes
+    langsung lebih aman karena tidak bergantung pada akses URL Supabase.
     """
     # 1. YOLO detection (pakai SAHI)
-    detections = await call_yolo(image_url)
+    if image_bytes is not None:
+        detections = await call_yolo_bytes(image_bytes)
+    else:
+        detections = await call_yolo(image_url)
 
     if not detections:
         return ([], [])  # Return empty tuple
