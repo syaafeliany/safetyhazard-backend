@@ -5,8 +5,20 @@ from PIL import Image
 from app.services.severity_rules import get_severity
 from app.services.area_rules import check_ppe_compliance, check_special_hazards
 
-YOLO_SERVICE_URL = os.getenv("YOLO_SERVICE_URL", "https://compute-vision-safetyhazard-production.up.railway.app")
-RAG_SERVICE_URL  = os.getenv("RAG_SERVICE_URL",  "https://mattel-ehss-rag-production-12a3.up.railway.app")
+def _ensure_protocol(url: str) -> str:
+    """Tambahkan https:// kalau env var URL tidak menyertakan protokol.
+
+    Railway env kadang di-set tanpa protokol (mis. 'compute-vision-...railway.app'),
+    yang membuat httpx melempar UnsupportedProtocol — padahal service jalan.
+    """
+    url = (url or "").strip()
+    if url and not url.startswith(("http://", "https://")):
+        return "https://" + url
+    return url
+
+
+YOLO_SERVICE_URL = _ensure_protocol(os.getenv("YOLO_SERVICE_URL", "https://compute-vision-safetyhazard-production.up.railway.app"))
+RAG_SERVICE_URL  = _ensure_protocol(os.getenv("RAG_SERVICE_URL",  "https://mattel-ehss-rag-production-12a3.up.railway.app"))
 
 
 # Confidence threshold default untuk YOLO. Diupdate ke 0.25 (API minimum).
