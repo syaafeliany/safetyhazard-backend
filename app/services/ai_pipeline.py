@@ -207,6 +207,14 @@ async def run_full_pipeline(image_url: str, area: str = "spray_decoration") -> t
     person_detections = [d for d in detections if d.get("label", "").lower() == "person"]
     person_count = len(person_detections)
 
+    # Jika YOLO tidak mendeteksi "person" tapi ada item PPE (helmet, boots,
+    # glasses, gloves, apron) — item PPE hanya muncul di atas orang, jadi
+    # anggap ada minimal 1 pekerja. Tanpa ini, PPE violations tidak pernah
+    # di-generate dan risk selalu "safe" padahal ada pelanggaran.
+    PPE_ITEM_LABELS = {"safety_helmet", "safety_glasses", "safety_gloves", "safety_boots", "apron"}
+    if person_count == 0 and detected_labels.intersection(PPE_ITEM_LABELS):
+        person_count = 1
+
     # a) Hazard lingkungan — setiap deteksi LANGSUNG jadi hazard
     hazard_detections = [
         d for d in detections if d.get("label", "").lower() in ENV_HAZARD_LABELS
@@ -216,8 +224,11 @@ async def run_full_pipeline(image_url: str, area: str = "spray_decoration") -> t
     # Dataset baru punya: person, trolley, phone, apron, safety_glasses, 
     # safety_gloves, safety_boots, safety_helmet (bukan "helmet"/"safety_vest" lagi)
     if person_count > 0:
-        # Gunakan area_rules untuk cek PPE compliance per area
-        missing_ppe = check_ppe_compliance(detected_labels, area, person_count)
+        # Gunakan area_rules untuk cek PPE compliance per area.
+        # Teruskan detections penuh supaya matching per-person (IoU)
+        # bisa berjalan — orang yang PPE-nya tidak lengkap tetap terdeteksi
+        # walau pekerja lain di frame sudah lengkap.
+        missing_ppe = check_ppe_compliance(detected_labels, area, person_count, detections)
         hazard_detections.extend(missing_ppe)
     
     # c) Special hazards (phone usage, trolley/person lane violations)

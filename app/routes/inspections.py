@@ -13,6 +13,8 @@ from app.models.hazard import Hazard
 from app.models.corrective_action import CorrectiveAction
 from app.services.ai_pipeline import call_yolo, call_yolo_bytes, call_rag, ENV_HAZARD_LABELS, run_full_pipeline, get_analysis_dimensions
 from app.services.severity_rules import get_severity, compute_risk_score
+from app.models.report import Report
+from app.services import email_service
 
 
 # ── Geometry & PPE inference helpers ───────────────────────────────
@@ -506,7 +508,7 @@ async def analyze_inspection(
     }
 
 
-def build_preview_boxes(detections, area=""):
+def build_preview_boxes(detections, area="", extra_violations=None):
     """
     Ubah deteksi mentah YOLO menjadi kotak siap-gambar untuk frontend.
 
@@ -515,8 +517,13 @@ def build_preview_boxes(detections, area=""):
     (warna class), violations di-flag is_violation=True (merah).
 
     Setiap kotak: {label, confidence_score, is_violation, bbox:{x1,y1,x2,y2,width,height}}.
+
+    extra_violations: violations tambahan dari check_ppe_compliance /
+    check_special_hazards (area-based, tidak butuh label "person").
     """
     violations = infer_ppe_violations(detections, area)
+    if extra_violations:
+        violations = violations + list(extra_violations)
     boxes = []
 
     def _to_box(label, confidence, is_violation, bbox):
@@ -549,12 +556,22 @@ def build_preview_boxes(detections, area=""):
             boxes.append(box)
 
     # Violations hasil inferensi — flag merah
+    first_person_bbox = next(
+        (bbox_to_list(d.get("bbox")) for d in detections
+         if str(d.get("label", "")).lower() == "person" and bbox_to_list(d.get("bbox"))),
+        None,
+    )
     for v in violations:
         label = (v.get("label") or v.get("yolo_label") or "").replace("_", " ")
         confidence = v.get("confidence")
         if confidence is None:
             confidence = v.get("confidence_score", 0.0)
-        box = _to_box(label, confidence, True, v.get("bbox"))
+        bbox = bbox_to_list(v.get("bbox"))
+        # Violation hasil area-rule (missing PPE) tidak punya posisi;
+        # pakai bbox person pertama sebagai lokasi kotak merah.
+        if not bbox and first_person_bbox:
+            bbox = first_person_bbox
+        box = _to_box(label, confidence, True, bbox)
         if box:
             boxes.append(box)
 
@@ -605,7 +622,7 @@ async def live_preview(
 
     # PPE violations (area-based)
     if person_count > 0:
-        missing_ppe = check_ppe_compliance(detected_labels, area, person_count)
+        missing_ppe = check_ppe_compliance(detected_labels, area, person_count, raw_detections)
         enriched.extend(missing_ppe)
 
     # Special hazards (phone usage, lane violations)
@@ -619,7 +636,7 @@ async def live_preview(
     _frame_w, _frame_h = get_analysis_dimensions(image_bytes)
 
     return {
-        "detections": build_preview_boxes(raw_detections, area),
+        "detections": build_preview_boxes(raw_detections, area, extra_violations=enriched),
         "frame_width": _frame_w,
         "frame_height": _frame_h,
         "summary": detection_summary(raw_detections, enriched),
@@ -687,7 +704,7 @@ async def analyze_frame(
 
     # PPE violations (area-based)
     if person_count > 0:
-        missing_ppe = check_ppe_compliance(detected_labels, area, person_count)
+        missing_ppe = check_ppe_compliance(detected_labels, area, person_count, raw_detections)
         enriched.extend(missing_ppe)
 
     # Special hazards (phone usage, lane violations)
@@ -699,12 +716,179 @@ async def analyze_frame(
     _frame_w, _frame_h = get_analysis_dimensions(image_bytes)
 
     return {
-        "detections": build_preview_boxes(raw_detections, area),
+        "detections": build_preview_boxes(raw_detections, area, extra_violations=enriched),
         "frame_width": _frame_w,
         "frame_height": _frame_h,
         "risk_score": risk["score"],
         "risk_band": risk["band"],
         "compliance": detection_summary(raw_detections, enriched),
+    }
+
+
+@router.post("/{inspection_id}/finalize")
+async def finalize_inspection(
+    inspection_id: str,
+    image: UploadFile = File(...),
+    area: str = Form("spray_decoration"),
+    current_user: User = Depends(inspector_only),
+    db: Session = Depends(get_db),
+):
+    """
+    Selesaikan analisa video/live: simpan hazard dari frame terakhir lalu
+    auto-generate report dalam satu panggilan tunggal.
+
+    Menyimpan frame terakhir sebagai gambar inspeksi, jalankan pipeline penuh, tulis hazard
+    + corrective actions ke DB, ganti status inspection ke "reported", buat PDF
+    report + baris Report — lalu kirim email ke manager/admin. Dipakai oleh
+    VideoAnalyzer (stop) dan CameraCapture (capture) supaya hasil deteksi
+    langsung masuk ke halaman Reports otomatis.
+    """
+    from io import BytesIO
+    from reportlab.lib.pagesizes import A4
+    from supabase import create_client as _supabase_create
+
+    # 1. Pastikan inspection milik user ini
+    inspection = db.query(Inspection).filter(
+        Inspection.id == inspection_id,
+        Inspection.user_id == current_user.id
+    ).first()
+    if not inspection:
+        raise HTTPException(status_code=404, detail="Inspection not found")
+
+    # 2. Simpan frame terakhir sebagai gambar inspeksi baru
+    image_bytes = await image.read()
+    filename = f"{uuid.uuid4()}_final.jpg"
+
+    supabase = get_supabase()
+    try:
+        supabase.storage.from_("inspections").upload(
+            path=filename,
+            file=image_bytes,
+            file_options={"content-type": "image/jpeg", "upsert": "true"}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to upload frame: {str(e)}")
+
+    inspection.image_url = f"{SUPABASE_URL}/storage/v1/object/public/inspections/{filename}"
+    inspection_area = area or inspection.area or "spray_decoration"
+
+    # 3. Pipeline penuh → hazard siap disimpan
+    try:
+        raw_detections, enriched_hazards = await run_full_pipeline(
+            inspection.image_url, inspection_area
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"AI analysis failed: {str(e)}")
+
+    # Bersihkan hazard lama (kalau ada analisa sebelumnya dari frame lain)
+    for old in db.query(Hazard).filter(Hazard.inspection_id == inspection.id).all():
+        for act in db.query(CorrectiveAction).filter(CorrectiveAction.hazard_id == old.id).all():
+            db.delete(act)
+        db.delete(old)
+    db.flush()
+
+    # 4. Simpan hazards + corrective actions
+    hazard_list = []
+    for h in enriched_hazards:
+        label      = h.get("yolo_label", "")
+        confidence = h.get("confidence_score", 1.0)
+        risk_level = h.get("risk_level", "medium")
+        ocr_text   = h.get("ocr_text", "")
+        corrective = h.get("corrective_action", {})
+        action_description = corrective.get("action_description", "Refer to EHSS guidelines")
+        priority = corrective.get("priority", "medium")
+        due_date = corrective.get("due_date")
+
+        hazard = Hazard(
+            inspection_id=inspection.id,
+            category=label.replace("_", " ").title(),
+            risk_level=risk_level,
+            confidence_score=confidence,
+            yolo_label=label,
+            ocr_text=ocr_text,
+            description=action_description,
+        )
+        db.add(hazard)
+        db.flush()
+
+        db.add(CorrectiveAction(
+            hazard_id=hazard.id,
+            action_description=action_description,
+            priority=priority,
+            due_date=due_date,
+            action_status="open",
+        ))
+        hazard_list.append({
+            "yolo_label": label,
+            "risk_level": risk_level,
+            "confidence_score": confidence,
+            "category": label.replace("_", " ").title(),
+        })
+
+    inspection.status = "analyzed"
+    db.commit()
+    db.refresh(inspection)
+
+    # 5. Auto-generate PDF report + simpan baris Report
+    from app.routes.reports import generate_pdf as _make_pdf
+
+    hazards_for_pdf = db.query(Hazard).filter(Hazard.inspection_id == inspection.id).all()
+    for h in hazards_for_pdf:
+        h.corrective_actions = db.query(CorrectiveAction).filter(
+            CorrectiveAction.hazard_id == h.id
+        ).all()
+
+    try:
+        pdf_bytes = _make_pdf(inspection, hazards_for_pdf)
+        pdf_name = f"report_{inspection.id}.pdf"
+        supabase.storage.from_("reports").upload(
+            path=pdf_name,
+            file=pdf_bytes,
+            file_options={"content-type": "application/pdf", "upsert": "true"}
+        )
+        pdf_url = f"{SUPABASE_URL}/storage/v1/object/public/reports/{pdf_name}"
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate PDF: {str(e)}")
+
+    report = Report(
+        inspection_id=inspection.id,
+        pdf_url=pdf_url,
+        generated_by=current_user.id,
+    )
+    db.add(report)
+    inspection.status = "reported"
+    db.commit()
+    db.refresh(report)
+
+    # Notifikasi email (non-fatal)
+    try:
+        _risk_order = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+        best = "low"
+        for h in hazards_for_pdf:
+            if _risk_order.get(h.risk_level, 0) > _risk_order.get(best, 0):
+                best = h.risk_level
+        recipients = db.query(User).filter(
+            User.role.in_(["manager", "admin"]),
+            User.status == "active",
+        ).all()
+        for recipient in recipients:
+            email_service.send_report_ready(
+                recipient.email,
+                current_user.name,
+                inspection.location,
+                best,
+                len(hazards_for_pdf),
+                str(inspection.id),
+            )
+    except Exception as e:
+        print(f"[EMAIL ERROR] Failed to send report-ready email: {e}")
+
+    return {
+        "inspection_id": str(inspection.id),
+        "report_id": str(report.id),
+        "status": inspection.status,
+        "hazards": hazard_list,
+        "summary": detection_summary(raw_detections, enriched_hazards),
     }
 
 

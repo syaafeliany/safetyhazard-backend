@@ -99,10 +99,18 @@ def check_ppe_compliance(
     detected_labels: set[str],
     area: str,
     person_count: int,
+    detections: list[dict] | None = None,
 ) -> list[dict]:
     """
-    Return a list of missing-PPE violation dicts based on which PPE labels
-    YOLO did NOT detect in the current frame.
+    Return a list of missing-PPE violation dicts per person.
+
+    Jika `detections` disertakan (list dict dengan bbox per deteksi), tiap
+    orang diperiksa satu-per-satu apakah PPE area yang dibutuhkan benar memotong
+    bbox orang tersebut (IoU). Dengan begitu, orang yang PPE-nya tidak lengkap
+    tetap terdeteksi walau ada pekerja lain yang benar-benar lengkap.
+
+    Jika `detections` None (legacy caller), fallback ke pendekatan set-label:
+    satu violation per class PPE yang tidak terdeteksi sama sekali.
 
     Parameters
     ----------
@@ -110,6 +118,7 @@ def check_ppe_compliance(
     area            : raw area string from the frontend / DB
     person_count    : number of persons detected (violations only generated
                       when at least one person is present)
+    detections      : optional full detection list (label+confidence_score+bbox)
     """
     if person_count == 0:
         return []
@@ -117,16 +126,82 @@ def check_ppe_compliance(
     config = get_area_config(area)
     violations: list[dict] = []
 
-    for ppe_class, violation_label in config["violation_labels"].items():
-        if ppe_class.lower() not in detected_labels:
-            # Generate one violation entry per missing PPE class.
-            # We don't do per-person bbox matching here because
-            # `detected_labels` is already a set — per-person matching
-            # is handled inside infer_ppe_violations() in inspections.py
-            # when full bbox data is available.
-            violations.append(_make_violation(violation_label))
+    if detections:
+        # ── Per-person matching (akurat) ──────────────────────────
+        persons = [d for d in detections if str(d.get("label", "")).lower() == "person"]
+        for person in persons:
+            bbox = person.get("bbox")
+            if not bbox:
+                continue
+            b = bbox
+            if isinstance(b, dict):
+                b = [b.get("x1", 0), b.get("y1", 0), b.get("x2", 0), b.get("y2", 0)]
+            if not isinstance(b, (list, tuple)) or len(b) < 4:
+                continue
+            px1, py1, px2, py2 = (float(v) for v in b[:4])
+            y_top, y_bot = min(py1, py2), max(py1, py2)
+            x_left, x_right = min(px1, px2), max(px1, px2)
+            height = max(1.0, y_bot - y_top)
+            top_half = [x_left, y_top, x_right, y_top + height / 2.0]
+
+            def _iou(a, bbox2):
+                if not bbox2:
+                    return 0.0
+                if isinstance(bbox2, dict):
+                    b2 = [bbox2.get("x1", 0), bbox2.get("y1", 0),
+                          bbox2.get("x2", 0), bbox2.get("y2", 0)]
+                else:
+                    b2 = list(bbox2)[:4]
+                try:
+                    b2 = [float(v) for v in b2]
+                except (TypeError, ValueError):
+                    return 0.0
+                ax1, ay1, ax2, ay2 = min(b2[0], b2[2]), min(b2[1], b2[3]), max(b2[0], b2[2]), max(b2[1], b2[3])
+                ix1, iy1 = max(a[0], ax1), max(a[1], ay1)
+                ix2, iy2 = min(a[2], ax2), min(a[3], ay2)
+                inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+                area_a = (a[2] - a[0]) * (a[3] - a[1])
+                area_b = (ax2 - ax1) * (ay2 - ay1)
+                union = area_a + area_b - inter
+                return inter / union if union > 0 else 0.0
+
+            def _wearing(item_label: str) -> bool:
+                return any(
+                    _iou(top_half, d.get("bbox")) >= 0.05
+                    for d in detections
+                    if str(d.get("label", "")).lower() == item_label
+                )
+
+            for ppe_class, violation_label in config["violation_labels"].items():
+                if not _wearing(ppe_class):
+                    v = _make_violation(violation_label)
+                    v["bbox"] = [x_left, y_top, x_right, y_top + height / 2.0]
+                    violations.append(v)
+
+    # ── Fallback / set-based ──────────────────────────────────────
+    # Dipakai saat detections tidak disertakan, ATAU saat YOLO tidak
+    # mendeteksi label "person" (person_count dari fallback PPE-items)
+    # sehingga per-person matching tidak bisa berjalan.
+    if not detections or not persons_matched(detections):
+        for ppe_class, violation_label in config["violation_labels"].items():
+            if ppe_class.lower() not in detected_labels:
+                # missing PPE — generate one violation per missing class
+                violations.append(_make_violation(violation_label))
 
     return violations
+
+
+def persons_matched(detections: list[dict]) -> bool:
+    """True jika ada deteksi person dengan bbox valid di list ini."""
+    for d in detections:
+        if str(d.get("label", "")).lower() != "person":
+            continue
+        b = d.get("bbox")
+        if isinstance(b, dict):
+            return all(k in b for k in ("x1", "y1", "x2", "y2"))
+        if isinstance(b, (list, tuple)):
+            return len(b) >= 4
+    return False
 
 
 def check_special_hazards(detections: list[dict], area: str) -> list[dict]:
