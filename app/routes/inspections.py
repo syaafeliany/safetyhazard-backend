@@ -677,6 +677,25 @@ async def analyze_frame(
 
     image_bytes = await image.read()
 
+    # ── DEBUG: simpan frame terakhir untuk verifikasi + ukur kecerahan ──
+    debug_url = ""
+    debug_mean_brightness = -1.0
+    try:
+        from io import BytesIO as _DebugBytesIO
+        from PIL import Image as _PILImage
+        _dbg = _PILImage.open(_DebugBytesIO(image_bytes)).convert("L")
+        px = list(_dbg.getdata())
+        if px:
+            debug_mean_brightness = round(sum(px) / len(px), 1)
+        supabase.storage.from_("inspections").upload(
+            path="debug_frame_last.jpg",
+            file=image_bytes,
+            file_options={"content-type": "image/jpeg", "upsert": "true"}
+        )
+        debug_url = f"{SUPABASE_URL}/storage/v1/object/public/inspections/debug_frame_last.jpg"
+    except Exception:
+        pass
+
     try:
         raw_detections = await call_yolo_bytes(image_bytes)
     except Exception:
@@ -722,6 +741,8 @@ async def analyze_frame(
         "risk_score": risk["score"],
         "risk_band": risk["band"],
         "compliance": detection_summary(raw_detections, enriched),
+        "debug_frame_url": debug_url,
+        "debug_mean_brightness": debug_mean_brightness,
     }
 
 
