@@ -698,7 +698,11 @@ async def analyze_frame(
 
     try:
         raw_detections = await call_yolo_bytes(image_bytes)
-    except Exception:
+        print(f"[analyze-frame] inspection={inspection_id} yolo_detections={len(raw_detections)} brightness={debug_mean_brightness} img_bytes={len(image_bytes)}", flush=True)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"[analyze-frame] inspection={inspection_id} YOLO error: {e}", flush=True)
         raw_detections = []
 
     detected_labels = {d.get("label", "").lower() for d in raw_detections}
@@ -800,7 +804,11 @@ async def finalize_inspection(
         raw_detections, enriched_hazards = await run_full_pipeline(
             image_url="", area=inspection_area, image_bytes=image_bytes
         )
+        print(f"[finalize] inspection={inspection_id} yolo={len(raw_detections)} hazards={len(enriched_hazards)}", flush=True)
     except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"[finalize] inspection={inspection_id} AI analysis failed: {e}", flush=True)
         raise HTTPException(status_code=502, detail=f"AI analysis failed: {str(e)}")
 
     # Bersihkan hazard lama (kalau ada analisa sebelumnya dari frame lain)
