@@ -1,1 +1,0 @@
-# SafetyVision FastAPI Backend
